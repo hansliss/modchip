@@ -1,0 +1,1433 @@
+
+AVRASM ver. 1.21  MC20SMT.ASM Sun Mar 26 17:32:18 2000
+
+
+         ;***************************************************************************
+         ;* Playstation Import enabler code
+         ;* 
+         ;* File Name            :modchip.asm
+         ;* Title                :Playstation Import enabler code
+         ;* Date                 :99-04-22
+         ;* Version              :1.3
+         ;* Support email        :Hans@Liss.pp.se
+         ;* Target MCU           :AT90S1200
+         ;* Clock type		:2MHz ceramic resonator or equiv.
+         ;*
+         ;* DESCRIPTION
+         ;*
+         ;* This code will send a Playstation region code (four characters - SCEE
+         ;* for Europe, SCEI for Japan and SCEA for the US) as a serial bitstream
+         ;* at about 250bps on an I/O pin, for a short time after RESET. It also
+         ;* acts as a software jumper between two lines, and can handle blanking of
+         ;* another signal. All these signals will go tristate after a certain time
+         ;* to hide the chip. The processor will restart when the lid is opened and
+         ;* closed and when the RESET switch is pressed and released.
+         ;*
+         ;* There is an option of connecting a pair of switches against GND to two
+         ;* pins, and they can then be used to select between three different CNT
+         ;* values, or disable the chip completely. The status of the switches is
+         ;* read every time the sequence is to be started.
+         ;*
+         ;* A three-legged, dual-colour LED can be connected to two of the I/O pins
+         ;* and GND.
+         ;* It will then be used to show what the processor is doing - cycling
+         ;* between colours when the code is being sent, turning green when it's
+         ;* ready, turning red when disabled and yellow during a pending RESET or
+         ;* media change.
+         ;*
+         ;*                       Processor chip layout
+         ;*
+         ;*	                      -----v-----
+         ;*                         1 [|o        |] 20   Vcc
+         ;*		Lid        2 [|         |] 19   
+         ;*		Reset      3 [|         |] 18   
+         ;*                         4 [|         |] 17   
+         ;*                         5 [|         |] 16   Calibrate
+         ;*              Blanking   6 [|         |] 15   LED
+         ;*              Data OUT   7 [|         |] 14   
+         ;*	        Jumper IN  8 [|         |] 13   Switch 2
+         ;*	        Jumper OUT 9 [|         |] 12   Switch 1
+         ;*              GND       10 [|         |] 11
+         ;*                            -----------
+         ;*
+         ;*
+         ;* This code is inspired by Scott Rider's widely distributed modchip code for
+         ;* the PIC 12C508. The Atmel chip is far better at most of these things - 
+         ;* many more registers and much more orthogonal instruction set along with
+         ;* four times the speed of a comparable PIC. The AT90S1200 is, however, more
+         ;* expensive than the 12C508, but OTOH it has lots more I/O pins,
+         ;* making all these bells and whistles possible. And programming it is fun!
+         ;* I am working with Atmels own "wavrasm" which as far as I know is 
+         ;* available on their home page on <http://www.atmel.com>.
+         ;*
+         ;* Going back to Scott Rider, we can define a mapping between the pin
+         ;* connections for his code, which appears to be the same for most of the
+         ;* commercially available chips. Pin 1 on the PIC is Vdd, 0-7V, and pin 8 is
+         ;* GND. Pin 5 is used for the "blanking" signal, to block the real data from
+         ;* the CD unit. Pin 6 is the serial data stream.
+         ;* This means that going from a 12C508 to a AT90S1200 gives the following mapping:
+         ;*
+         ;*    From pin    To pin
+         ;*           1 -> 20
+         ;*           5 -> 6
+         ;*           6 -> 7
+         ;*           8 -> 10
+         ;*
+         ;* This code was made for a modern PU-22 motherboard, which is handled
+         ;* somewhat differently. Instead of pin 5 on the 12C508, here we usually have
+         ;* a jumper cable between two positions on the board. In this solution,
+         ;* the LEFT one of these points should be connected to "Jumper IN", and
+         ;* the RIGHT one to "Jumper OUT".
+         ;* You can leave the jumper in there but then the chip can never be
+         ;* completely hidden, which may or may not be significant.
+         ;*
+         ;* Where to find the RESET and Lid signals on an old motherboard is left as
+         ;* an excercise for the reader. All I know is that the Lid signal was usually
+         ;* pin 4 on the older, 18 pin 16c84 modchips.
+         ;*
+         ;* More info and pictures can be found on <http://www.maxking.com>.
+         ;* On the PU-22 board, the CD Lid signal is the one close to the CD connector,
+         ;* and the RESET signal can be found on the upper half of the board.
+         ;*
+         ;* ********* *NEW for version 1.1 ***************
+         ;* I have cleaned up the delay sections and created a single delay function,
+         ;* together with a matching macro, WAITMS. Now the chip will read its delay
+         ;* constants from the EEPROM making it tunable to different chip speeds.
+         ;* There is also a subroutine "calibrate" that can be used to calibrate the
+         ;* delay loop. Connect a pushbutton between earth and pin 19 on the chip. Keep
+         ;* this pressed when starting the Playstation and keep it pressed for exactly
+         ;* 10 seconds, then release it. The new delay constants will be calculated
+         ;* and stored into the EEPROM.
+         ;*
+         ;* ********* *NEW for version 1.2 ***************
+         ;* I have remade some of the Count handling. There are still three different
+         ;* Count values available, selectable with the switch. Now, however, it is
+         ;* possible to change those values. To _decrease_ the current count value,
+         ;* simply boot a game and press the Calibrate button whenever you think
+         ;* that enough pulses have passed, usually just after the copyright screen
+         ;* has disappeared and turned black. To _increase_ the value, wait until the
+         ;* end of the cycle and then press the button. The current Count will increase
+         ;* by ten.
+         ;* There is now also a way to easily recalibrate the speed with a default value
+         ;* for 5V. Just do a normal calibration but release the button almost immediately,
+         ;* and the calibration values will be set to 115 and 103, respectively (my
+         ;* calculated values).
+         ;*
+         ;* ********* *NEW for version 1.2.1 ***************
+         ;* Added debounce to lid and RESET switches. Added weak pullup to RESET input
+         ;*
+         ;* ********* *NEW for version 1.3   ***************
+         ;* The default timing is now calibrated for an AT90S1200 with a 2MHz ceramic
+         ;* resonator, and the default Count value is calibrated for Final Fantasy VIII,
+         ;* which works just fine with this code. All the features are still there but
+         ;* they are mostly unnecessary now..
+         ;*
+         ;***************************************************************************
+         
+          .device	AT90S1200	;Prohibits use of non-implemented instructions
+         
+          .include "1200def.inc"
+         ;***************************************************************************
+         ;* A P P L I C A T I O N   N O T E   F O R   T H E   A V R   F A M I L Y
+         ;* 
+         ;* Number		:AVR000
+         ;* File Name		:"1200def.inc"
+         ;* Title		:Register/Bit Definitions for the AT90S1200
+         ;* Date	 		:97.12.11
+         ;* Version		:1.20
+         ;* Support telephone	:+47 72 88 87 20 (ATMEL Norway)
+         ;* Support fax		:+47 72 88 87 18 (ATMEL Norway)
+         ;* Support E-Mail	:avr@atmel.com
+         ;* Target MCU		:AT90S1200
+         ;*
+         ;* DESCRIPTION
+         ;* When including this file in the assembly program file, all I/O register
+         ;* names and I/O register bit names appearing in the data book can be used.
+         ;* 
+         ;* The Register names are represented by their hexadecimal addresses.
+         ;* 
+         ;* The Register Bit names are represented by their bit number (0-7).
+         ;* 
+         ;* Please observe the difference in using the bit names with instructions
+         ;* such as "sbr"/"cbr" (set/clear bit in register) and "sbrs"/"sbrc" 
+         ;* (skip if bit in register set/cleared). The following example illustrates
+         ;* this:
+         ;* 
+         ;* in	r16,PORTB		;read PORTB latch
+         ;* sbr	r16,(1<<PB6)+(1<<PB5)	;set PB6 and PB5 (use masks, not bit#)
+         ;* out  PORTB,r16		;output to PORTB
+         ;*
+         ;* in	r16,TIFR		;read the Timer Interrupt Flag Register
+         ;* sbrc	r16,TOV0		;test the overflow flag (use bit#)
+         ;* rjmp	TOV0_is_set		;jump if set
+         ;* ...				;otherwise do something else
+         ;***************************************************************************
+         
+         ;***** Specify Device
+          .device AT90S1200
+         
+         ;***** I/O Register Definitions
+          .equ	SREG	=$3f
+          .equ	GIMSK	=$3b
+          .equ	TIMSK	=$39
+          .equ	TIFR	=$38
+          .equ	MCUCR	=$35
+          .equ	TCCR0	=$33
+          .equ	TCNT0	=$32
+          .equ	WDTCR	=$21
+          .equ	EEAR	=$1e
+          .equ	EEDR	=$1d
+          .equ	EECR	=$1c
+          .equ	PORTB	=$18
+          .equ	DDRB	=$17
+          .equ	PINB	=$16
+          .equ	PORTD	=$12
+          .equ	DDRD	=$11
+          .equ	PIND	=$10
+          .equ	ACSR	=$08
+         
+         ;***** Bit Definitions
+         
+          .equ	INT0	=6
+         
+          .equ	TOIE0	=1
+         
+          .equ	TOV0	=1
+         
+          .equ	SE	=5
+          .equ	SM	=4
+          .equ	ISC01	=1
+          .equ	ISC00	=0
+         
+          .equ	CS02	=2
+          .equ	CS01	=1
+          .equ	CS00	=0
+         
+          .equ	WDE	=3
+          .equ	WDP2	=2
+          .equ	WDP1	=1
+          .equ	WDP0	=0
+         
+          .equ	EEWE	=1
+          .equ	EERE	=0
+         
+          .equ	PB7	=7
+          .equ	PB6	=6
+          .equ	PB5	=5
+          .equ	PB4	=4
+          .equ	PB3	=3
+          .equ	PB2	=2
+          .equ	PB1	=1
+          .equ	PB0	=0
+         
+          .equ	DDB7	=7
+          .equ	DDB6	=6
+          .equ	DDB5	=5
+          .equ	DDB4	=4
+          .equ	DDB3	=3
+          .equ	DDB2	=2
+          .equ	DDB1	=1
+          .equ	DDB0	=0
+         
+          .equ	PINB7	=7
+          .equ	PINB6	=6
+          .equ	PINB5	=5
+          .equ	PINB4	=4
+          .equ	PINB3	=3
+          .equ	PINB2	=2
+          .equ	PINB1	=1
+          .equ	PINB0	=0
+         
+          .equ	PD6	=6
+          .equ	PD5	=5
+          .equ	PD4	=4
+          .equ	PD3	=3
+          .equ	PD2	=2
+          .equ	PD1	=1
+          .equ	PD0	=0
+         
+          .equ	DDD6	=6
+          .equ	DDD5	=5
+          .equ	DDD4	=4
+          .equ	DDD3	=3
+          .equ	DDD2	=2
+          .equ	DDD1	=1
+          .equ	DDD0	=0
+         
+          .equ	PIND6	=6
+          .equ	PIND5	=5
+          .equ	PIND4	=4
+          .equ	PIND3	=3
+          .equ	PIND2	=2
+          .equ	PIND1	=1
+          .equ	PIND0	=0
+         
+          .equ	ACD	=7
+          .equ	ACO	=5
+          .equ	ACI	=4
+          .equ	ACIE	=3
+          .equ	ACIS1	=1
+          .equ	ACIS0	=0
+         
+          .equ	INT0addr=$001	;External Interrupt0 Vector Address
+          .equ	OVF0addr=$002	;Overflow0 Interrupt Vector Address
+          .equ	ACIaddr =$003	;Analog Comparator Interrupt Vector Address
+         
+          .def	ZL	=r30
+         
+          .LISTMAC
+         
+         ;***** Global Register Variables
+         
+         
+         ;***** Arg registers
+          .def	A1	=r16
+          .def	A2	=r17
+          .def	A3	=r18
+          .def	CNT	=r19
+          .def	D1	=r28
+          .def	D2	=r29
+          .def	X	=r30
+          .def	curC	=r23
+         
+         ;***** Scratch regs
+          .def	I	=r20
+          .def	J	=r21
+          .def	K	=r22
+         
+         ;***** EEPROM vars
+          .equ	storedD1=0
+          .equ	storedD2=1
+          .equ	storedC1=2
+          .equ	storedC2=3
+          .equ	storedC3=4
+         
+         ;.equ	defaultD1=115
+         ;.equ	defaultD2=103
+          .equ	defaultD1=$FE
+          .equ	defaultD2=$FD
+          .equ	defaultC=100
+         
+         ;******* PORT B
+         
+         ;  Switches - active low: 0=off, 1=Use COUNT1, 2=Use COUNT2, 3=Use COUNT3
+          .equ	SWITCH1=0
+          .equ	SWITCH2=1
+         
+          .equ	SWITCH3=4
+         
+         ;  Red and green LED ouput pins
+          .equ	LEDBIT=3
+         ;.equ	GLEDBIT=6
+         
+          .equ	TRIG=2
+         
+         ;******* PORT D
+         
+         ;  Media change signal, active high input
+          .equ	LSIG=0
+         
+         ;  Reset signal, active low input
+          .equ	RSIG=1
+         
+         ;  "Blanking" signal - extra pin for old PSX 4-line chips
+          .equ	BLANK=2
+         
+         ;  Subchannel data stream, output
+          .equ	PORTBIT=3
+         
+         ;  "Jumper" input
+          .equ	JUMPIN=4
+         
+         ;  "Jumper" output
+          .equ	JUMPOUT=5
+         
+         ;Count values for short and long settings, respectively
+          .equ	COUNT1=172
+          .equ	COUNT2=186
+          .equ	COUNT3=198
+         
+         ;***** Macros
+          .macro	SENDONE
+          	cbi	DDRD,PORTBIT
+          .endmacro
+         
+          .macro	SENDZERO
+          	sbi	DDRD,PORTBIT
+          .endmacro
+         
+          .macro	LIGHTON
+          	sbi	DDRB,LEDBIT
+          .endmacro
+         
+          .macro	LIGHTOFF
+          	cbi	DDRB,LEDBIT
+          .endmacro
+         
+          .macro	WAITMS
+          	ldi	X,@0
+          	rcall	waitxms
+          .endmacro
+         
+          .macro	WAITMSP
+          	ldi	X,@0
+          	rcall	waitxmsp
+          .endmacro
+         
+          .macro	WAITSHORT
+          	ldi	I,@0
+          	rcall	waitshort
+          .endmacro
+         
+         ; Execute the software "jumper". Five cycles.
+          .macro	DOJUMP
+          	sbis	PIND,JUMPIN
+          	sbi	DDRD,JUMPOUT
+          	sbic	PIND,JUMPIN
+          	cbi	DDRD,JUMPOUT
+          .endmacro
+         
+          .macro	ENBLANK
+          	cbi	PORTD,BLANK
+          	sbi	DDRD,BLANK
+          .endmacro
+         
+          .macro	DEBLANK
+          	cbi	PORTD,BLANK
+          	cbi	DDRD,BLANK
+          .endmacro
+         
+         ;***** Code
+         
+000000 c1f0      	rjmp	START		;Reset Handle
+         
+         ;****************************************************************************
+         ;*
+         ;* Subroutine 'waitxms'
+         ;*
+         ;* Stored vars D1 and D2 is used for calibration.
+         ;*
+         ;* This subroutine will wait for x ms minus one LDI+call+return.
+         ;* The innermost loop is D1 * (5 + 1 + 1 + 2) cycles. We execute that loop
+         ;* (+ 3 cycles for DEC+BRNI) X-1 times, and then we do the rest minus 8 cycles
+         ;* in a separate loop (D2 * (5 + 1 + 1 + 1 + 2)). This leaves 8 cycles = 7 for
+         ;* call/return and one for the necessary LDI X,# instruction.
+         ;*
+         ;***************************************************************************
+         
+         
+          waitxms:
+000001 95ea      	dec	X
+000002 f089      	breq	vxloop20
+          wxloop0:
+000003 2f4c      	mov	I,d1
+          wxloop1:
+000004   +  	DOJUMP
+000004 9b84      	sbis	PIND,JUMPIN
+000005 9a8d      	sbi	DDRD,JUMPOUT
+000006 9984      	sbic	PIND,JUMPIN
+000007 988d      	cbi	DDRD,JUMPOUT
+          .endmacro
+000008 0000      	nop
+000009 0000      	nop
+00000a 0000      	nop
+00000b 0000      	nop
+00000c 0000      	nop
+00000d 0000      	nop
+00000e 0000      	nop
+00000f 0000      	nop
+000010 954a      	dec	I
+000011 f791      	brne	wxloop1
+         
+000012 95ea      	dec	X
+000013 f779      	brne	wxloop0
+         
+          vxloop20:
+000014 2f4d      	mov	I,d2
+          wxloop2:
+000015   +  	DOJUMP
+000015 9b84      	sbis	PIND,JUMPIN
+000016 9a8d      	sbi	DDRD,JUMPOUT
+000017 9984      	sbic	PIND,JUMPIN
+000018 988d      	cbi	DDRD,JUMPOUT
+          .endmacro
+000019 0000      	nop
+00001a 0000      	nop
+00001b 0000      	nop
+00001c 0000      	nop
+00001d 0000      	nop
+00001e 0000      	nop
+00001f 0000      	nop
+000020 0000      	nop
+000021 0000      	nop
+000022 954a      	dec	I
+000023 f789      	brne	wxloop2
+         
+000024 9508      	ret
+         
+          waitxmsp:
+000025 95ea      	dec	X
+000026 f091      	breq	vxploop20
+          wxploop0:
+000027 2f4c      	mov	I,d1
+          wxploop1:
+000028 0000      	nop
+000029 0000      	nop
+00002a 0000      	nop
+00002b 0000      	nop
+00002c 0000      	nop
+00002d 0000      	nop
+00002e 0000      	nop
+00002f 0000      	nop
+000030 0000      	nop
+000031 0000      	nop
+000032 0000      	nop
+000033 0000      	nop
+000034 0000      	nop
+000035 954a      	dec	I
+000036 f789      	brne	wxploop1
+         
+000037 95ea      	dec	X
+000038 f771      	brne	wxploop0
+         
+          vxploop20:
+000039 2f4d      	mov	I,d2
+          wxploop2:
+00003a 0000      	nop
+00003b 0000      	nop
+00003c 0000      	nop
+00003d 0000      	nop
+00003e 0000      	nop
+00003f 0000      	nop
+000040 0000      	nop
+000041 0000      	nop
+000042 0000      	nop
+000043 0000      	nop
+000044 0000      	nop
+000045 0000      	nop
+000046 0000      	nop
+000047 0000      	nop
+000048 954a      	dec	I
+000049 f781      	brne	wxploop2
+         
+00004a 9508      	ret
+         
+          waitshort:
+00004b 954a      	dec	I
+00004c f7f1      	brne	waitshort
+00004d 9508      	ret
+         ;****************************************************************************
+         ;*
+         ;* Subroutine 'calibrate', called from sysinit
+         ;*
+         ;* Do 10000 cycles each loop, increasing r24:r25 by one each pass.
+         ;* This subroutine will calibrate 1 ms if run during 10 sec. The switch on
+         ;* SWITCH3 is checked for release on every pass.
+         ;*
+         ;* 'makecns' will calculate the delay constants d1 and d2 as follows:
+         ;* 	d1=(n-3)/9
+         ;* 	d2=(n-8)/10
+         ;* and then store them to the EEPROM
+         ;*
+         ;****************************************************************************
+         
+          calibrate:
+00004e   +  	LIGHTON
+00004e 9abb      	sbi	DDRB,LEDBIT
+          .endmacro
+00004f e080      	ldi	r24,0
+000050 e090      	ldi	r25,0
+          cloop0:
+000051 99b4      	sbic	PINB,SWITCH3
+000052 c00a      	rjmp	makecns
+         
+000053 e245      	ldi	I,37
+          cloop1:
+000054 e559      	ldi	J,89
+          cloop2:
+000055 955a      	dec	J
+000056 f7f1      	brne	cloop2
+         
+000057 954a      	dec	I
+000058 f7d9      	brne	cloop1
+         
+000059 9593      	inc	r25
+00005a f7b1      	brne	cloop0
+00005b 9583      	inc	r24
+00005c cff4      	rjmp	cloop0
+         
+          makecns:
+00005d 5093      	subi	r25,3
+00005e 4080      	sbci	r24,0
+         
+          mc01:
+00005f 2fa8      	mov	r26,r24
+000060 2fb9      	mov	r27,r25
+000061 e0c0      	ldi	d1,0
+          l1:
+000062 30a0      	cpi	r26,0
+000063 f411      	brne	l12
+000064 30b9      	cpi	r27,9
+000065 f020      	brlo	l13
+          l12:
+000066 50b9      	subi	r27,9
+000067 40a0      	sbci	r26,0
+         
+000068 95c3      	inc	d1
+000069 cff8      	rjmp	l1
+         
+          l13:
+00006a 5095      	subi	r25,5
+00006b 4080      	sbci	r24,0
+00006c e0d0      	ldi	d2,0
+          l2:
+00006d 3080      	cpi	r24,0
+00006e f411      	brne	l22
+00006f 309a      	cpi	r25,10
+000070 f020      	brlo	l23
+          l22:
+000071 509a      	subi	r25,10
+000072 4080      	sbci	r24,0
+         
+000073 95d3      	inc	d2
+000074 cff8      	rjmp	l2
+         
+          l23:
+         ; ** If d1 is less than 5, we have a value reset at hand and will set
+         ; ** the values to a suitable 5V default
+000075 30c5      	cpi	d1,5
+000076 f488      	brsh	l231
+000077 efce      	ldi	d1,defaultD1
+000078 efdd      	ldi	d2,defaultD2
+000079   +  	LIGHTON
+000079 9abb      	sbi	DDRB,LEDBIT
+          .endmacro
+00007a   +  	WAITMS	125
+00007a e7ed      	ldi	X,0x7d
+00007b df85      	rcall	waitxms
+          .endmacro
+00007c   +  	LIGHTOFF
+00007c 98bb      	cbi	DDRB,LEDBIT
+          .endmacro
+00007d   +  	WAITMS	125
+00007d e7ed      	ldi	X,0x7d
+00007e df82      	rcall	waitxms
+          .endmacro
+00007f   +  	LIGHTON
+00007f 9abb      	sbi	DDRB,LEDBIT
+          .endmacro
+000080   +  	WAITMS	125
+000080 e7ed      	ldi	X,0x7d
+000081 df7f      	rcall	waitxms
+          .endmacro
+000082   +  	LIGHTOFF
+000082 98bb      	cbi	DDRB,LEDBIT
+          .endmacro
+000083   +  	WAITMS	125
+000083 e7ed      	ldi	X,0x7d
+000084 df7c      	rcall	waitxms
+          .endmacro
+000085   +  	LIGHTON
+000085 9abb      	sbi	DDRB,LEDBIT
+          .endmacro
+000086   +  	WAITMS	125
+000086 e7ed      	ldi	X,0x7d
+000087 df79      	rcall	waitxms
+          .endmacro
+          l231:
+000088 e040      	ldi	I,storedD1
+000089 bb4e      	out	EEAR,I
+00008a bbcd      	out	EEDR,d1
+00008b 9ae1      	sbi	EECR,EEWE
+          l24:
+00008c 99e1      	sbic	EECR,EEWE
+00008d cffe      	rjmp	l24
+         
+00008e e041      	ldi	I,storedD2
+00008f bb4e      	out	EEAR,I
+000090 bbdd      	out	EEDR,d2
+000091 9ae1      	sbi	EECR,EEWE
+         
+000092   +  	LIGHTOFF
+000092 98bb      	cbi	DDRB,LEDBIT
+          .endmacro
+000093 c113      	rjmp	cont
+         
+         ;****************************************************************************
+         ;*
+         ;* Subroutine 'sendbyte'
+         ;*
+         ;* This subroutine will send one character to the (globally defined) I/O
+         ;* port.
+         ;* A 'one' is done by making the port bit an input bit and letting the
+         ;* PSX pullup pull the line up. A 'zero' is done by making it an output
+         ;* - the port bit data is a 'zero' during all this so the only thing
+         ;* that changes is the port direction, which is set to 'one' for output
+         ;* ('zero'), and 'zero' for input ('one').
+         ;* Each bit will take 4 ms, and one start bit and two stop bits will be sent
+         ;*
+         ;***************************************************************************
+         
+          sendbyte:
+         ; Invert byte
+000094 9500      	com	A1
+         ; Send a start bit
+000095   +  	SENDONE
+000095 988b      	cbi	DDRD,PORTBIT
+          .endmacro
+000096   +  	WAITMS	4
+000096 e0e4      	ldi	X,0x4
+000097 df69      	rcall	waitxms
+          .endmacro
+000098 e018      	ldi	A2,8
+000099 9507      sbloop0:ror	A1
+00009a f010      	brcs	bitset
+00009b   +  	SENDZERO
+00009b 9a8b      	sbi	DDRD,PORTBIT
+          .endmacro
+00009c f408      	brcc	bitclr
+00009d   +  bitset:	SENDONE
+00009d 988b      	cbi	DDRD,PORTBIT
+          .endmacro
+00009e   +  bitclr:	WAITMS	4
+00009e e0e4      	ldi	X,0x4
+00009f df61      	rcall	waitxms
+          .endmacro
+0000a0 951a      	dec	A2
+0000a1 f7b9      	brne	sbloop0
+         ; Send two stop bits
+0000a2   +  	SENDZERO
+0000a2 9a8b      	sbi	DDRD,PORTBIT
+          .endmacro
+0000a3   +  	WAITMS	4
+0000a3 e0e4      	ldi	X,0x4
+0000a4 df5c      	rcall	waitxms
+          .endmacro
+0000a5   +  	WAITMS	4
+0000a5 e0e4      	ldi	X,0x4
+0000a6 df5a      	rcall	waitxms
+          .endmacro
+0000a7 9508      	ret
+         
+         ;****************************************************************************
+         ;*
+         ;* Subroutine 'waitbyte'
+         ;*
+         ;***************************************************************************
+         
+          waitbyte:
+         ; Invert byte
+0000a8 9500      	com	A1
+         ; Wait for start bit
+          wb00:
+0000a9 9983      	sbic	PIND,PORTBIT
+0000aa cffe      	rjmp	wb00
+0000ab   +  	WAITSHORT 60
+0000ab e34c      	ldi	I,0x3c
+0000ac df9e      	rcall	waitshort
+          .endmacro
+0000ad 9983      	sbic	PIND,PORTBIT
+0000ae cffa      	rjmp	wb00
+0000af   +  	WAITSHORT 60
+0000af e34c      	ldi	I,0x3c
+0000b0 df9a      	rcall	waitshort
+          .endmacro
+0000b1 9983      	sbic	PIND,PORTBIT
+0000b2 cff6      	rjmp	wb00
+         ;	rcall clight
+          wb01:
+0000b3 9983      	sbic	PIND,PORTBIT
+0000b4 c009      	rjmp	wb02
+0000b5   +  	WAITSHORT 60
+0000b5 e34c      	ldi	I,0x3c
+0000b6 df94      	rcall	waitshort
+          .endmacro
+0000b7 9983      	sbic	PIND,PORTBIT
+0000b8 c005      	rjmp	wb02
+0000b9   +  	WAITSHORT 60
+0000b9 e34c      	ldi	I,0x3c
+0000ba df90      	rcall	waitshort
+          .endmacro
+0000bb 9983      	sbic	PIND,PORTBIT
+0000bc c001      	rjmp	wb02
+0000bd cff5      	rjmp	wb01
+         
+          wb02:
+         ;	rcall clight
+         	
+0000be   +  	WAITMSP	7
+0000be e0e7      	ldi	X,0x7
+0000bf df65      	rcall	waitxmsp
+          .endmacro
+         
+0000c0 e018      	ldi	A2,8
+          wbloop0:
+0000c1 9507      	ror	A1
+0000c2 f008      	brcs	wbitset
+0000c3 f460      	brcc	wbitclr
+          wbitset:
+0000c4 9983      	sbic	PIND,PORTBIT
+0000c5 c017      	rjmp	wbloop1
+0000c6   +  	WAITSHORT 60
+0000c6 e34c      	ldi	I,0x3c
+0000c7 df83      	rcall	waitshort
+          .endmacro
+0000c8 9983      	sbic	PIND,PORTBIT
+0000c9 c013      	rjmp	wbloop1
+0000ca   +  	WAITSHORT 60
+0000ca e34c      	ldi	I,0x3c
+0000cb df7f      	rcall	waitshort
+          .endmacro
+0000cc 9983      	sbic	PIND,PORTBIT
+0000cd c00f      	rjmp	wbloop1
+0000ce 9408      	sec
+0000cf 9508      	ret
+         		
+          wbitclr:
+0000d0 9983      	sbic	PIND,PORTBIT
+0000d1 c009      	rjmp	wbc01
+0000d2   +  	WAITSHORT 60
+0000d2 e34c      	ldi	I,0x3c
+0000d3 df77      	rcall	waitshort
+          .endmacro
+0000d4 9983      	sbic	PIND,PORTBIT
+0000d5 c005      	rjmp	wbc01
+0000d6   +  	WAITSHORT 60
+0000d6 e34c      	ldi	I,0x3c
+0000d7 df73      	rcall	waitshort
+          .endmacro
+0000d8 9983      	sbic	PIND,PORTBIT
+0000d9 c001      	rjmp	wbc01
+0000da c002      	rjmp	wbloop1
+          wbc01:
+0000db 9408      	sec
+0000dc 9508      	ret
+         		
+          wbloop1:
+         ;	rcall	clight
+0000dd   +  	WAITMSP	3
+0000dd e0e3      	ldi	X,0x3
+0000de df46      	rcall	waitxmsp
+          .endmacro
+0000df 951a      	dec	A2
+0000e0 f701      	brne	wbloop0
+         ; Expect two stop bits
+         
+         ;	LIGHTOFF
+0000e1 9b83      	sbis	PIND,PORTBIT
+0000e2 c00a      	rjmp	waitok
+0000e3   +  	WAITSHORT 60
+0000e3 e34c      	ldi	I,0x3c
+0000e4 df66      	rcall	waitshort
+          .endmacro
+0000e5 9b83      	sbis	PIND,PORTBIT
+0000e6 c006      	rjmp	waitok
+0000e7   +  	WAITSHORT 60
+0000e7 e34c      	ldi	I,0x3c
+0000e8 df62      	rcall	waitshort
+          .endmacro
+0000e9 9b83      	sbis	PIND,PORTBIT
+0000ea c002      	rjmp	waitok
+          waitnok:
+0000eb 9408      	sec
+0000ec 9508      	ret
+         
+          waitok:
+0000ed   +  	WAITMSP	4
+0000ed e0e4      	ldi	X,0x4
+0000ee df36      	rcall	waitxmsp
+          .endmacro
+         
+0000ef 9488      	clc
+0000f0 9508      	ret
+         
+          readbyte:
+0000f1 e000      	ldi	A1,0
+         ; Wait for start bit
+          rb00:
+0000f2 9983      	sbic	PIND,PORTBIT
+0000f3 cffe      	rjmp	rb00
+          rb01:
+0000f4 9b83      	sbis	PIND,PORTBIT
+0000f5 cffe      	rjmp	rb01
+         	
+0000f6   +  	WAITMSP	1
+0000f6 e0e1      	ldi	X,0x1
+0000f7 df2d      	rcall	waitxmsp
+          .endmacro
+         
+0000f8 9b83      	sbis	PIND,PORTBIT
+0000f9 cffa      	rjmp	rb01
+         	
+0000fa   +  	WAITMSP	1
+0000fa e0e1      	ldi	X,0x1
+0000fb df29      	rcall	waitxmsp
+          .endmacro
+         
+0000fc 9b83      	sbis	PIND,PORTBIT
+0000fd cff6      	rjmp	rb01
+         	
+0000fe   +  	WAITMSP	1
+0000fe e0e1      	ldi	X,0x1
+0000ff df25      	rcall	waitxmsp
+          .endmacro
+000100 9b83      	sbis	PIND,PORTBIT
+         
+000101 cff2      	rjmp	rb01
+         	
+000102   +  	WAITMSP	3
+000102 e0e3      	ldi	X,0x3
+000103 df21      	rcall	waitxmsp
+          .endmacro
+         
+000104 e018      	ldi	A2,8
+          rbloop0:
+000105 9983      	sbic	PIND,PORTBIT
+000106 c002      	rjmp	rbitset
+000107 9488      	clc
+000108 c001      	rjmp	rbloop1
+          rbitset:
+000109 9408      	sec
+          rbloop1:
+00010a 9507      	ror	A1
+00010b   +  	WAITMSP	4
+00010b e0e4      	ldi	X,0x4
+00010c df18      	rcall	waitxmsp
+          .endmacro
+00010d 951a      	dec	A2
+00010e f7b1      	brne	rbloop0
+00010f 9500      	com	A1
+000110 9508      	ret
+         
+         
+         ;****************************************************************************
+         ;*
+         ;* Subroutine 'sysinit'
+         ;*
+         ;* This subroutine will initialize the I/O ports and check the switch
+         ;* settings
+         ;*
+         ;* LED is unlit
+         ;*
+         ;***************************************************************************
+         
+          sysinit:
+         ; Prepare the Reset and Media Change signal inputs (no pullup)
+         ; and the SWITCH3 portbit (internal pullup)
+000111 9889      	cbi	DDRD,RSIG
+000112 9888      	cbi	DDRD,LSIG
+000113 9a91      	sbi	PORTD,RSIG
+000114 9890      	cbi	PORTD,LSIG
+000115 98bc      	cbi	DDRB,SWITCH3
+000116 9ac4      	sbi	PORTB,SWITCH3
+000117 9aba      	sbi	DDRB,TRIG
+000118 98c2      	cbi	PORTB,TRIG
+         
+         ; Set the LED signal as input
+000119 98c3      	cbi	PORTB,LEDBIT
+         
+         ; Load the stored variables from the EEPROM
+00011a e040      	ldi	I,storedD1
+00011b bb4e      	out	EEAR,I
+00011c 9ae0      	sbi	EECR,EERE
+00011d b3cd      	in	d1,EEDR
+00011e e041      	ldi	I,storedD2
+00011f bb4e      	out	EEAR,I
+000120 9ae0      	sbi	EECR,EERE
+000121 b3dd      	in	d2,EEDR
+         
+000122 3fcf      	cpi	d1,255
+000123 f411      	brne	sinit00
+000124 efce      	ldi	d1,defaultD1
+000125 efdd      	ldi	d2,defaultD2
+         
+          sinit00:
+         
+         ; Check if the Calibrate switch is pressed
+000126 9bb4      	sbis	PINB,SWITCH3
+000127 cf26      	rjmp	calibrate
+         
+         ; Check the DIP switch to see whether we should go tristate or which count calue
+         ; to select
+000128 98b8      	cbi	DDRB,SWITCH1
+000129 9ac0      	sbi	PORTB,SWITCH1
+00012a 98b9      	cbi	DDRB,SWITCH2
+00012b 9ac1      	sbi	PORTB,SWITCH2
+         
+00012c 99b0      	sbic	PINB,SWITCH1
+00012d c004      	rjmp	sinit1
+00012e 9bb1      	sbis	PINB,SWITCH2
+00012f c0bf      	rjmp	passive
+000130 e073      	ldi	curC,storedC2
+000131 c005      	rjmp	sinitx
+         
+          sinit1:
+000132 99b1      	sbic	PINB,SWITCH2
+000133 c002      	rjmp	sinit3
+000134 e072      	ldi	curC,storedC1
+000135 c001      	rjmp	sinitx
+         
+          sinit3:
+000136 e074      	ldi	curC,storedC3
+         
+          sinitx:
+000137 bb7e      	out	EEAR,curC
+000138 9ae0      	sbi	EECR,EERE
+000139 b33d      	in	CNT,EEDR
+         
+00013a 3f3f      	cpi	CNT,255
+00013b f409      	brne	sinitx1
+00013c e634      	ldi	CNT,defaultC
+         
+          sinitx1:
+00013d 988b      	cbi	DDRD,PORTBIT
+00013e 9893      	cbi	PORTD,PORTBIT
+         
+         
+         ; Prepare the "jumper" bits. The input will have a pullup and the output
+         ; will assume there is a pullup, and send the bits in the same way as the
+         ; data is sent on PORTBIT. 
+00013f 988d      	cbi	DDRD,JUMPOUT
+000140 988c      	cbi	DDRD,JUMPIN
+000141 9a94      	sbi	PORTD,JUMPIN
+000142 9895      	cbi	PORTD,JUMPOUT
+         
+000143 e063      	ldi	k,3
+000144 9508      	ret
+         
+         ;****************************************************************************
+         ;*
+         ;* Subroutine 'init'
+         ;*
+         ;* This subroutine will wait for 50 ms and then take the I/O port bit low,
+         ;* then wait for 1164 ms more before returning. 850 ms into the latter, the
+         ;* blanking bit is taken low.
+         ;*
+         ;***************************************************************************
+         
+          init:
+000145   +  	WAITMS	50
+000145 e3e2      	ldi	X,0x32
+000146 deba      	rcall	waitxms
+          .endmacro
+         ;make pin go low as output
+         ;	SENDZERO
+000147 e111      	ldi	A2,17
+000148   +  iloop1:	WAITMSP	50
+000148 e3e2      	ldi	X,0x32
+000149 dedb      	rcall	waitxmsp
+          .endmacro
+00014a 951a      	dec	A2
+00014b f7e1      	brne	iloop1
+         ;	ENBLANK
+00014c e016      	ldi	A2,6
+00014d   +  iloop2:	WAITMSP	50
+00014d e3e2      	ldi	X,0x32
+00014e ded6      	rcall	waitxmsp
+          .endmacro
+00014f 951a      	dec	A2
+000150 f7e1      	brne	iloop2
+000151   +  	WAITMSP	14
+000151 e0ee      	ldi	X,0xe
+000152 ded2      	rcall	waitxmsp
+          .endmacro
+000153 9508      	ret
+         
+         ;****************************************************************************
+         ;*
+         ;* Subroutine 'sendcode'
+         ;*
+         ;* This subroutine will send a four-byte string to the (globally defined)
+         ;* I/O port a specified number of times, then return.
+         ;*
+         ;***************************************************************************
+         
+          sendcode:
+         ;	mov	A3,CNT
+000154   +  	LIGHTOFF
+000154 98bb      	cbi	DDRB,LEDBIT
+          .endmacro
+          scloop0:
+         ;	rcall	clight
+         
+         
+         ;	WAITMS	72
+000155   +  	WAITMS	30
+000155 e1ee      	ldi	X,0x1e
+000156 deaa      	rcall	waitxms
+          .endmacro
+         
+          es0:	
+000157 e503      	ldi	A1,'S'
+000158 df4f      	rcall	waitbyte
+000159 f3e8      	brcs	es0
+         
+00015a e403      	ldi	A1,'C'
+00015b df4c      	rcall	waitbyte
+00015c f3d0      	brcs	es0
+         
+00015d d042      	rcall	clight
+         
+00015e e405      	ldi	A1,'E'
+00015f df48      	rcall	waitbyte
+000160 f3b0      	brcs	es0
+         
+000161   +  	WAITMSP	2
+000161 e0e2      	ldi	X,0x2
+000162 dec2      	rcall	waitxmsp
+          .endmacro
+         
+000163   +  	ENBLANK
+000163 9892      	cbi	PORTD,BLANK
+000164 9a8a      	sbi	DDRD,BLANK
+          .endmacro
+000165 9a94      	sbi	PORTD,JUMPIN
+000166 9893      	cbi	PORTD,PORTBIT
+000167 988b      	cbi	DDRD,PORTBIT
+         	
+000168 e405      	ldi	A1,'E'
+000169 df2a      	rcall	sendbyte
+         
+00016a   +  	DEBLANK
+00016a 9892      	cbi	PORTD,BLANK
+00016b 988a      	cbi	DDRD,BLANK
+          .endmacro
+00016c 988d      	cbi	DDRD,JUMPOUT
+00016d 988c      	cbi	DDRD,JUMPIN
+00016e 9894      	cbi	PORTD,JUMPIN
+00016f 9895      	cbi	PORTD,JUMPOUT
+000170 988b      	cbi	DDRD,PORTBIT
+000171 9893      	cbi	PORTD,PORTBIT
+         
+         ; Check if the Calibrate switch is pressed. If it is,
+         ; terminate the loop here and store the new value for
+         ; this particular COUNT in the EEPROM
+         
+         ;	sbis	PINB,SWITCH3
+         ;	rjmp	screcal
+         
+         ;	dec	A3
+         
+         ;	brne	scloop0
+000172 cfe2      	rjmp	scloop0
+         ;	ret
+         
+          screcal:
+000173 9bb4      	sbis	PINB,SWITCH3
+000174 cffe      	rjmp	screcal
+         
+000175 1b32      	sub	CNT,A3
+000176 bb7e      	out	EEAR,curC
+000177 bb3d      	out	EEDR,CNT
+000178 9ae1      	sbi	EECR,EEWE
+          scrc01:
+000179 99e1      	sbic	EECR,EEWE
+00017a cffe      	rjmp	scrc01
+         
+00017b   +  	LIGHTON
+00017b 9abb      	sbi	DDRB,LEDBIT
+          .endmacro
+00017c   +  	WAITMS	125
+00017c e7ed      	ldi	X,0x7d
+00017d de83      	rcall	waitxms
+          .endmacro
+00017e   +  	LIGHTOFF
+00017e 98bb      	cbi	DDRB,LEDBIT
+          .endmacro
+00017f   +  	WAITMS	125
+00017f e7ed      	ldi	X,0x7d
+000180 de80      	rcall	waitxms
+          .endmacro
+000181   +  	LIGHTON
+000181 9abb      	sbi	DDRB,LEDBIT
+          .endmacro
+000182   +  	WAITMS	125
+000182 e7ed      	ldi	X,0x7d
+000183 de7d      	rcall	waitxms
+          .endmacro
+000184   +  	LIGHTOFF
+000184 98bb      	cbi	DDRB,LEDBIT
+          .endmacro
+000185   +  	WAITMS	125
+000185 e7ed      	ldi	X,0x7d
+000186 de7a      	rcall	waitxms
+          .endmacro
+000187   +  	LIGHTON
+000187 9abb      	sbi	DDRB,LEDBIT
+          .endmacro
+000188   +  	WAITMS	125
+000188 e7ed      	ldi	X,0x7d
+000189 de77      	rcall	waitxms
+          .endmacro
+00018a   +  	LIGHTOFF
+00018a 98bb      	cbi	DDRB,LEDBIT
+          .endmacro
+00018b   +  	WAITMS	125
+00018b e7ed      	ldi	X,0x7d
+00018c de74      	rcall	waitxms
+          .endmacro
+00018d   +  	LIGHTON
+00018d 9abb      	sbi	DDRB,LEDBIT
+          .endmacro
+00018e   +  	WAITMS	125
+00018e e7ed      	ldi	X,0x7d
+00018f de71      	rcall	waitxms
+          .endmacro
+000190   +  	LIGHTOFF
+000190 98bb      	cbi	DDRB,LEDBIT
+          .endmacro
+000191   +  	WAITMS	125
+000191 e7ed      	ldi	X,0x7d
+000192 de6e      	rcall	waitxms
+          .endmacro
+000193   +  	LIGHTON
+000193 9abb      	sbi	DDRB,LEDBIT
+          .endmacro
+000194   +  	WAITMS	125
+000194 e7ed      	ldi	X,0x7d
+000195 de6b      	rcall	waitxms
+          .endmacro
+000196   +  	LIGHTOFF
+000196 98bb      	cbi	DDRB,LEDBIT
+          .endmacro
+000197   +  	WAITMS	125
+000197 e7ed      	ldi	X,0x7d
+000198 de68      	rcall	waitxms
+          .endmacro
+000199   +  	LIGHTON
+000199 9abb      	sbi	DDRB,LEDBIT
+          .endmacro
+00019a   +  	WAITMS	125
+00019a e7ed      	ldi	X,0x7d
+00019b de65      	rcall	waitxms
+          .endmacro
+00019c   +  	LIGHTOFF
+00019c 98bb      	cbi	DDRB,LEDBIT
+          .endmacro
+00019d   +  	WAITMS	125
+00019d e7ed      	ldi	X,0x7d
+00019e de62      	rcall	waitxms
+          .endmacro
+         
+00019f 9508      	ret
+         
+         ;****************************************************************************
+         ;*
+         ;* Subroutine 'clight'
+         ;*
+         ;* This subroutine will set the color of the color LED to one of three states:
+         ;* red, green or both
+         ;*
+         ;***************************************************************************
+         
+          clight:
+0001a0 956a      	dec	K
+0001a1 f011      	breq	low
+0001a2 9abb      	sbi	DDRB,LEDBIT
+0001a3 f411      	brne	cret
+0001a4 98bb      low:	cbi	DDRB,LEDBIT
+0001a5 e062      	ldi	K,2
+0001a6 9508      cret:	ret
+         
+         ;****************************************************************************
+         ;*
+         ;* Subroutine 'cont'
+         ;*
+         ;* This subroutine will do whatever the processor is supposed to do after
+         ;* sending the code for the specified time. For now this means to loop,
+         ;* possibly restarting on reset or "open lid"
+         ;*
+         ;***************************************************************************
+         
+          cont:
+0001a7   +  	DEBLANK
+0001a7 9892      	cbi	PORTD,BLANK
+0001a8 988a      	cbi	DDRD,BLANK
+          .endmacro
+0001a9 988b      	cbi	DDRD,PORTBIT
+0001aa 9893      	cbi	PORTD,PORTBIT
+0001ab 988d      	cbi	DDRD,JUMPOUT
+0001ac 988c      	cbi	DDRD,JUMPIN
+0001ad 9894      	cbi	PORTD,JUMPIN
+0001ae 9895      	cbi	PORTD,JUMPOUT
+         
+          cont0:
+0001af 9b81      	sbis	PIND,RSIG
+0001b0 c005      	rjmp	rcheck
+0001b1 9980      	sbic	PIND,LSIG
+0001b2 c009      	rjmp	lcheck
+0001b3 9bb4      	sbis	PINB,SWITCH3
+0001b4 c00d      	rjmp	countup
+0001b5 cff9      	rjmp	cont0
+         
+         ; Wait for Reset button release
+          rcheck:
+0001b6   +  	WAITMS	1
+0001b6 e0e1      	ldi	X,0x1
+0001b7 de49      	rcall	waitxms
+          .endmacro
+0001b8   +  	LIGHTON
+0001b8 9abb      	sbi	DDRB,LEDBIT
+          .endmacro
+0001b9 9b81      	sbis	PIND,RSIG
+0001ba cffb      	rjmp	rcheck
+0001bb c035      	rjmp	START
+         	
+         ; Wait for Close
+          lcheck:
+0001bc   +  	WAITMS	1
+0001bc e0e1      	ldi	X,0x1
+0001bd de43      	rcall	waitxms
+          .endmacro
+0001be   +  	LIGHTON
+0001be 9abb      	sbi	DDRB,LEDBIT
+          .endmacro
+0001bf 9980      	sbic	PIND,LSIG
+0001c0 cffb      	rjmp	lcheck
+0001c1 c02f      	rjmp	START
+         
+         ; Increase the current COUNT value by 10 if the
+         ; calibrate button is pressed.
+         
+          countup:
+0001c2 9bb4      	sbis	PINB,SWITCH3
+0001c3 cffe      	rjmp	countup
+         
+0001c4 5f36      	subi	CNT,-10
+0001c5 bb7e      	out	EEAR,curC
+0001c6 bb3d      	out	EEDR,CNT
+0001c7 9ae1      	sbi	EECR,EEWE
+          cu01:
+0001c8 99e1      	sbic	EECR,EEWE
+0001c9 cffe      	rjmp	cu01
+         
+0001ca   +  	LIGHTON
+0001ca 9abb      	sbi	DDRB,LEDBIT
+          .endmacro
+0001cb   +  	WAITMS	125
+0001cb e7ed      	ldi	X,0x7d
+0001cc de34      	rcall	waitxms
+          .endmacro
+0001cd   +  	LIGHTOFF
+0001cd 98bb      	cbi	DDRB,LEDBIT
+          .endmacro
+0001ce   +  	WAITMS	125
+0001ce e7ed      	ldi	X,0x7d
+0001cf de31      	rcall	waitxms
+          .endmacro
+0001d0   +  	LIGHTON
+0001d0 9abb      	sbi	DDRB,LEDBIT
+          .endmacro
+0001d1   +  	WAITMS	125
+0001d1 e7ed      	ldi	X,0x7d
+0001d2 de2e      	rcall	waitxms
+          .endmacro
+0001d3   +  	LIGHTOFF
+0001d3 98bb      	cbi	DDRB,LEDBIT
+          .endmacro
+0001d4   +  	WAITMS	125
+0001d4 e7ed      	ldi	X,0x7d
+0001d5 de2b      	rcall	waitxms
+          .endmacro
+0001d6   +  	LIGHTON
+0001d6 9abb      	sbi	DDRB,LEDBIT
+          .endmacro
+0001d7   +  	WAITMS	125
+0001d7 e7ed      	ldi	X,0x7d
+0001d8 de28      	rcall	waitxms
+          .endmacro
+0001d9   +  	LIGHTOFF
+0001d9 98bb      	cbi	DDRB,LEDBIT
+          .endmacro
+0001da   +  	WAITMS	125
+0001da e7ed      	ldi	X,0x7d
+0001db de25      	rcall	waitxms
+          .endmacro
+0001dc   +  	LIGHTON
+0001dc 9abb      	sbi	DDRB,LEDBIT
+          .endmacro
+0001dd   +  	WAITMS	125
+0001dd e7ed      	ldi	X,0x7d
+0001de de22      	rcall	waitxms
+          .endmacro
+0001df   +  	LIGHTOFF
+0001df 98bb      	cbi	DDRB,LEDBIT
+          .endmacro
+0001e0   +  	WAITMS	125
+0001e0 e7ed      	ldi	X,0x7d
+0001e1 de1f      	rcall	waitxms
+          .endmacro
+0001e2   +  	LIGHTON
+0001e2 9abb      	sbi	DDRB,LEDBIT
+          .endmacro
+0001e3   +  	WAITMS	125
+0001e3 e7ed      	ldi	X,0x7d
+0001e4 de1c      	rcall	waitxms
+          .endmacro
+0001e5   +  	LIGHTOFF
+0001e5 98bb      	cbi	DDRB,LEDBIT
+          .endmacro
+0001e6   +  	WAITMS	125
+0001e6 e7ed      	ldi	X,0x7d
+0001e7 de19      	rcall	waitxms
+          .endmacro
+0001e8   +  	LIGHTON
+0001e8 9abb      	sbi	DDRB,LEDBIT
+          .endmacro
+0001e9   +  	WAITMS	125
+0001e9 e7ed      	ldi	X,0x7d
+0001ea de16      	rcall	waitxms
+          .endmacro
+0001eb   +  	LIGHTOFF
+0001eb 98bb      	cbi	DDRB,LEDBIT
+          .endmacro
+0001ec   +  	WAITMS	125
+0001ec e7ed      	ldi	X,0x7d
+0001ed de13      	rcall	waitxms
+          .endmacro
+         
+0001ee cfc0      	rjmp	cont0
+         	
+         
+         ;****************************************************************************
+         ;*
+         ;* Subroutine 'passive'
+         ;*
+         ;* This subroutine will just put the 'chip' in passive, tristate mode.
+         ;* LED will be red
+         ;*
+         ;***************************************************************************
+         
+          passive:
+0001ef   +  	LIGHTOFF
+0001ef 98bb      	cbi	DDRB,LEDBIT
+          .endmacro
+         
+0001f0 cfb6      	rjmp	cont
+         
+         ;****************************************************************************
+         ;*
+         ;* Main Program
+         ;*
+         ;* This program calls the routines "sysinit", "init", "sendcode" and "cont"
+         ;* in that order.
+         ;*
+         ;***************************************************************************
+         
+         ;***** Main Program Register Variables
+         
+          START:
+         ; Init ports
+0001f1 df1f      	rcall sysinit
+         ; Do the initial signalling. The LED will be set to green after this
+0001f2 df52      	rcall init
+0001f3 df60      	rcall	sendcode
+         
+0001f4   +  	LIGHTOFF
+0001f4 98bb      	cbi	DDRB,LEDBIT
+          .endmacro
+         
+         ; ..and go wait for better weather or possibly a RESET
+0001f5 cfb1      	rjmp	cont
+
+Assembly complete with no errors.

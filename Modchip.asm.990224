@@ -1,0 +1,539 @@
+;***************************************************************************
+;* Playstation Import enabler code
+;* 
+;* File Name            :modchip.asm
+;* Title                :Playstation Import enabler code
+;* Date                 :98.02.22
+;* Version              :1.0
+;* Support email        :Hans@Liss.pp.se
+;* Target MCU           :AT90S1200A
+;* Clock type		:Internal RC @1 MHz (about 5V)
+;*
+;* DESCRIPTION
+;*
+;* This code will send a Playstation region code (four characters - SCEE
+;* for Europe, SCEI for Japan and SCEA for the US) as a serial bitstream
+;* at about 250bps on an I/O pin, for a short time after RESET. It also
+;* acts as a software jumper between two lines, and can handle blanking of
+;* another signal. All these signals will go tristate after a certain time
+;* to hide the chip. The processor will restart when the lid is opened and
+;* closed and when the RESET switch is pressed and released.
+;*
+;* There is an option of connecting a pair of switches against GND to two
+;* pins, and they can then be used to select between three different CNT
+;* values, or disable the chip completely. The status of the switches is
+;* read every time the sequence is to be started.
+;*
+;* A three-legged, dual-colour LED can be connected to two pins and GND.
+;* It will then be used to show what the processor is doing - cycling
+;* between colours when the code is being sent, turning green when it's
+;* ready, turning red when disabled and yellow during a pending RESET or
+;* media change.
+;*
+;*                       Processor chip layout
+;*
+;*	                      -----v-----
+;*                         1 [|o        |] 20   Vcc
+;*		Lid        2 [|         |] 19
+;*		Reset      3 [|         |] 18   Green LED
+;*                         4 [|         |] 17   Red LED
+;*                         5 [|         |] 16   Jumper OUT
+;*              Blanking   6 [|         |] 15   Data OUT
+;*                         7 [|         |] 14   Jumper IN
+;*	                   8 [|         |] 13   Switch 2
+;*	                   9 [|         |] 12   Switch 1
+;*              GND       10 [|         |] 11
+;*                            -----------
+;*
+;*
+;* This code is inspired by Scott Rider's widely distributed modchip code for
+;* the PIC 12C508. The Atmel chip is far better at most of these things - 
+;* stable RC speed, more registers and much more orthogonal instruction set
+;* along with four times the speed of a comparable PIC. The AT90S1200 is,
+;* however, more expensive than the 12C508, but OTOH it has lots more I/O pins,
+;* making all these bells and whistles possible. And programming it is fun!
+;* I am working with Atmels own "wavrasm" which as far as I know is 
+;* available on their home page on <http://www.atmel.com>.
+;*
+;* Going back to Scott Rider, we can define a mapping between the pin
+;* connections for his code, which appears to be the same for most of the
+;* commercially available chips. Pin 1 on the PIC is +5V, and pin 8 is GND.
+;* Pin 5 is used for the "blanking" signal, to block the real data from the
+;* CD unit. Pin 6 is the serial data stream.
+;* This means that going from a 12C508 to a AV90S1200 means:
+;*
+;*    From pin    To pin
+;*           1 -> 20
+;*           5 -> 6
+;*           6 -> 15
+;*           8 -> 10
+;*
+;* Now, this code was made for a modern PU-22 motherboard, which is handled
+;* somewhat differently. Here we usually have a jumper cable between two
+;* positions on the board and skip the blanking signal. For this solution,
+;* the LEFT of these points should be connected to pin 14, Jumper IN, and
+;* the RIGHT one to pin 16, Jumper OUT.
+;*
+;* You can leave the jumper in there but then the chip can never be
+;* completely hidden, which may or may not be significant.
+;*
+;* Where to find the RESET and Lid signals on an old motherboard is left as
+;* an excercise for the reader.
+;*
+;* More info and pictures can be found on <http://www.maxking.com>.
+;* On the PU-22 board, the CD Lid signal is the one close to the CD connector,
+;* and the RESET signal can be found on the upper half of the board.
+;*
+;* NOTE that if you do not connect or pullup the RESET signal, the LED will
+;* turn yellow at the end of the cycle, and will not detect the Lid open
+;* signal, even if it is connected. Everything else will still work OK.
+;*
+;***************************************************************************
+
+.device	AT90S1200	;Prohibits use of non-implemented instructions
+
+.include "1200def.inc"
+
+.LISTMAC
+
+;***** Global Register Variables
+
+
+;***** Arg registers
+.def	A1	=r16
+.def	A2	=r17
+.def	A3	=r18
+.def	CNT	=r19
+
+;***** Scratch regs
+.def	I	=r20
+.def	J	=r21
+.def	K	=r22
+
+;******* PORT B
+
+;  Switches - active low: 0=off, 1=Use COUNT1, 2=Use COUNT2, 3=Use COUNT3
+.equ	SWITCH1=0
+.equ	SWITCH2=1
+
+;  "Jumper" input
+.equ	JUMPIN=2
+
+;  Subchannel data stream, output
+.equ	PORTBIT=3
+
+;  "Jumper" output
+.equ	JUMPOUT=4
+
+;  Red and green LED ouput pins
+.equ	RLEDBIT=5
+.equ	GLEDBIT=6
+
+;******* PORT D
+
+;  Reset signal, active low input
+.equ	RSIG=1
+
+;  Media change signal, active high input
+.equ	LSIG=0
+
+;  "Blanking" signal - extra pin for old PSX 4-line chips
+.equ	BLANK=2
+
+;Count values for short and long settings, respectively
+.equ	COUNT1=84
+.equ	COUNT2=86
+.equ	COUNT3=99
+
+;***** Macros
+.macro	SENDONE
+	cbi	DDRB,PORTBIT
+.endmacro
+
+.macro	SENDZERO
+	sbi	DDRB,PORTBIT
+.endmacro
+
+.macro	LIGHTBOTH
+	sbi	PORTB,GLEDBIT
+	sbi	PORTB,RLEDBIT
+.endmacro
+
+.macro	LIGHTRED
+	sbi	PORTB,GLEDBIT
+	cbi	PORTB,RLEDBIT
+.endmacro
+
+.macro	LIGHTGRN
+	cbi	PORTB,GLEDBIT
+	sbi	PORTB,RLEDBIT
+.endmacro
+
+.macro	LIGHTOFF
+	cbi	PORTB,GLEDBIT
+	cbi	PORTB,RLEDBIT
+.endmacro
+
+; Execute the software "jumper". Five cycles.
+.macro	DOJUMP
+	sbis	PINB,JUMPIN
+	sbi	DDRB,JUMPOUT
+	sbic	PINB,JUMPIN
+	cbi	DDRB,JUMPOUT
+.endmacro
+
+.macro	ENBLANK
+	cbi	PORTD,BLANK
+	sbi	DDRD,BLANK
+.endmacro
+
+.macro	DEBLANK
+	cbi	PORTD,BLANK
+	cbi	DDRD,BLANK
+.endmacro
+
+;***** Code
+
+	rjmp	START		;Reset Handle
+
+;****************************************************************************
+;*
+;* Subroutine 'wait1ms'
+;*
+;* This subroutine will wait for 1 ms, minus the call/return time
+;*
+;***************************************************************************
+
+; 1038 cycles to burn
+; 7 lost for call+ret => 1031 left
+; 1 lost for ldi matches one "regained" when brne takes only one cycle
+;   so each loop consumes 8 cycles/pass
+; Each pass of the outer loop will take J*8+3 cycles, so we fill out with
+; NOPs
+
+wait1ms:
+	ldi	I,38
+w1loop0:
+	ldi	J,3
+w1loop1:DOJUMP
+	dec	J
+	brne	w1loop1
+	dec	I
+	brne	w1loop0
+	nop
+	nop
+	nop
+	nop
+	nop
+	ret
+
+;****************************************************************************
+;*
+;* Subroutine 'wait4ms'
+;*
+;* This subroutine will wait for 4 ms, minus the call/return time
+;*
+;***************************************************************************
+
+; 4173 cycles to burn
+; 7 lost for call+ret => 4166 left
+; 1 lost for ldi matches one "regained" when brne takes only one cycle
+;   so each loop consumes 10 cycles/pass
+; Each pass of the outer loop will take J*10+3 cycles, so we fill out with
+; NOPs
+
+wait4ms:
+	ldi	I,126
+w4loop0:
+	ldi	J,3
+w4loop1:DOJUMP
+	nop
+	nop
+	dec	J
+	brne	w4loop1
+	dec	I
+	brne	w4loop0
+	nop
+	nop
+	nop
+	nop
+	nop
+	nop
+	nop
+	nop
+	ret
+
+;****************************************************************************
+;*
+;* Subroutine 'waitxms'
+;*
+;* This subroutine will wait for x ms, excluding the call/return time
+;*
+;***************************************************************************
+
+; Here we lose 6 cycles / ms, which amounts to a 0.5 % error. Think
+; we can live with that..
+
+waitxms:
+	rcall wait1ms
+	dec A1
+	brne waitxms
+	ret
+
+;****************************************************************************
+;*
+;* Subroutine 'sendbyte'
+;*
+;* This subroutine will send one character to the (globally defined) I/O
+;* port.
+;* A 'one' is done by making the port bit an input bit and letting the
+;* PSX pullup pull the line up. A 'zero' is done by making it an output
+;* - the port bit data is a 'zero' during all this so the only thing
+;* that changes is the port direction, which is set to 'one' for output
+;* ('zero'), and 'zero' for input ('one').
+;* Each bit will take 4 ms, and one start bit and two stop bits will be sent
+;*
+;***************************************************************************
+
+sendbyte:
+; Invert byte
+	com	A1
+; Send a start bit
+	SENDONE
+	rcall	wait4ms
+	ldi	A2,8
+sbloop0:ror	A1
+	brcs	bitset
+	SENDZERO
+	brcc	bitclr
+bitset:	SENDONE
+bitclr:	rcall	wait4ms
+	dec	A2
+	brne	sbloop0
+; Send two stop bits
+	SENDZERO
+	rcall	wait4ms	
+	rcall	wait4ms	
+	ret
+
+;****************************************************************************
+;*
+;* Subroutine 'sysinit'
+;*
+;* This subroutine will initialize the I/O ports and check the switch
+;* settings
+;*
+;* LED is unlit
+;*
+;***************************************************************************
+
+sysinit:
+; Prepare the Reset and Media Change signal inputs
+	cbi	DDRD,RSIG
+	cbi	DDRD,LSIG
+	cbi	PORTD,RSIG
+	cbi	PORTD,LSIG
+
+; Check the switch to see whether we should go tristate or not
+	cbi	DDRB,SWITCH1
+	sbi	PORTB,SWITCH1
+	cbi	DDRB,SWITCH2
+	sbi	PORTB,SWITCH2
+
+;	rcall	wait1ms
+
+	sbic	PINB,SWITCH1
+	rjmp	sinit1
+	sbis	PINB,SWITCH2
+	rjmp	passive
+	ldi	CNT,COUNT2
+	rjmp	sinitx
+
+sinit1:
+	sbic	PINB,SWITCH2
+	rjmp	sinit3
+	ldi	CNT,COUNT1
+	rjmp	sinitx
+
+sinit3:
+	ldi	CNT,COUNT3
+
+sinitx:
+	SENDONE
+	cbi	PORTB,PORTBIT
+
+	sbi	DDRB,GLEDBIT
+	sbi	DDRB,RLEDBIT
+
+; Prepare the "jumper" bits. The input will have a pullup and the output
+; will assume there is a pullup, and send the bits in the same way as the
+; data is sent on PORTBIT. 
+	cbi	DDRB,JUMPOUT
+	cbi	DDRB,JUMPIN
+	sbi	PORTB,JUMPIN
+	cbi	PORTB,JUMPOUT
+
+	ldi	k,3
+	ret
+
+;****************************************************************************
+;*
+;* Subroutine 'init'
+;*
+;* This subroutine will wait for 50 ms and then take the I/O port bit low,
+;* then wait for 1164 ms more before returning. 850 ms into the latter, the
+;* blanking bit is taken low.
+;*
+;***************************************************************************
+
+init:
+	ldi	A1,50
+	rcall	waitxms
+;make pin go low as output
+	SENDZERO
+	ldi	A2,17
+iloop1:	ldi	A1,50
+	rcall	waitxms
+	dec	A2
+	brne	iloop1
+	ENBLANK
+	ldi	A2,6
+iloop2:	ldi	A1,50
+	rcall	waitxms
+	dec	A2
+	brne	iloop2
+	ldi	A1,14
+	rcall	waitxms
+	ret
+
+;****************************************************************************
+;*
+;* Subroutine 'sendcode'
+;*
+;* This subroutine will send a four-byte string to the (globally defined)
+;* I/O port a specified number of times, then return.
+;*
+;***************************************************************************
+
+sendcode:
+	mov	A3,CNT
+scloop0:
+	rcall	clight
+
+	ldi	A1,72
+	rcall	waitxms
+	ldi	A1,'S'
+	rcall	sendbyte
+	ldi	A1,'C'
+	rcall	sendbyte
+	ldi	A1,'E'
+	rcall	sendbyte
+	ldi	A1,'E'
+	rcall	sendbyte
+
+	dec	A3
+	brne	scloop0
+	ret
+
+;****************************************************************************
+;*
+;* Subroutine 'clight'
+;*
+;* This subroutine will set the color of the color LED to one of three states:
+;* red, green or both
+;*
+;***************************************************************************
+
+clight:
+	mov	A1,K
+	ror	A1
+	brcs	lowset
+	cbi	PORTB,GLEDBIT
+	brcc	lowclr
+lowset:	sbi	PORTB,GLEDBIT	
+lowclr:	ror	A1
+	brcs	hiset
+	cbi	PORTB,RLEDBIT
+	brcc	hiclr
+hiset:	sbi	PORTB,RLEDBIT
+hiclr:	dec	K
+	brne	cret
+	ldi	K,3
+cret:	ret
+
+;****************************************************************************
+;*
+;* Subroutine 'cont'
+;*
+;* This subroutine will do whatever the processor is supposed to do after
+;* sending the code for the specified time. For now this means to loop,
+;* possibly restarting on reset or "open lid"
+;*
+;***************************************************************************
+
+cont:
+	DEBLANK
+	cbi	DDRB,PORTBIT
+	cbi	PORTB,PORTBIT
+	cbi	DDRB,JUMPOUT
+	cbi	DDRB,JUMPIN
+	cbi	PORTB,JUMPIN
+	cbi	PORTB,JUMPOUT
+
+cont0:
+	sbis	PIND,RSIG
+	rjmp	rcheck
+	sbic	PIND,LSIG
+	rjmp	lcheck
+	rjmp	cont0
+
+rcheck:
+	LIGHTBOTH
+	sbis	PIND,RSIG
+	rjmp	rcheck
+	rjmp	START
+	
+lcheck:
+	LIGHTBOTH
+	sbic	PIND,LSIG
+	rjmp	lcheck
+	rjmp	START
+
+;****************************************************************************
+;*
+;* Subroutine 'passive'
+;*
+;* This subroutine will just put the 'chip' in passive, tristate mode.
+;* LED will be red
+;*
+;***************************************************************************
+
+passive:
+	sbi	DDRB,GLEDBIT
+	sbi	DDRB,RLEDBIT
+	LIGHTRED
+
+	rjmp	cont
+
+;****************************************************************************
+;*
+;* Main Program
+;*
+;* This program calls the routines "sysinit", "init", "sendcode" and "cont"
+;* in that order.
+;*
+;***************************************************************************
+
+;***** Main Program Register Variables
+
+START:
+; Init ports
+	rcall sysinit
+; Do the initial signalling. The LED will be set to green after this
+	rcall init
+	rcall	sendcode
+
+	LIGHTGRN
+
+; ..and go wait for better weather or possibly a RESET
+	rjmp	cont
